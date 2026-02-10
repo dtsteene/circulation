@@ -32,9 +32,10 @@
 
 # %%
 import os
+import json
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.optimize import minimize, Bounds
+from scipy.optimize import minimize, Bounds, differential_evolution
 from circulation.regazzoni2020 import Regazzoni2020
 import logging
 
@@ -46,6 +47,9 @@ targets = {
     "RV_ESP": 25.0,   # Right Ventricle End-Systolic Pressure [mmHg]
     "RV_EDP": 4.0,    # Right Ventricle End-Diastolic Pressure [mmHg]
     "Ao_DBP": 80.0,   # Aortic Diastolic Blood Pressure [mmHg]
+    "LA_P_MEAN": 9.0,   # Target physiological LA pressure (8-10 mmHg)
+    "RV_EDV":    150.0, # Target a healthy RV size (prevents dilation)
+    "LV_EDV":    150.0, # CRITICALLY IMPORTANT: Prevent LV Dilation (Keep EF > 50%)
 }
 
 print("Target Hemodynamics:")
@@ -75,27 +79,24 @@ class ModelInterface:
         # Configuration: (Parameter Name, Initial Guess, Lower Bound, Upper Bound, Scale Factor)
         # Scale Factor is used to divide the real value so the optimizer sees ~1.0
         self.config = [
-            # Contractility (EA) - Represents E_max (End-Systolic Elastance).
-            # "Strength" of the pump. Higher EA -> Higher Systolic Pressure.
-            ("chambers.LV.EA",          3.5,    1.0,   10.0,  1.0),
-            ("chambers.RV.EA",          0.6,    0.2,   5.0,   1.0),
+            # 1. Contractility: Widen the floor. It implies the heart needs to be stronger if we constrain volume.
+            ("chambers.LV.EA",          2.0,    0.5,   10.0,  1.0), # <--- Widened range significantly
+            ("chambers.RV.EA",          0.55,   0.2,   5.0,   1.0),
 
-            # Passive Stiffness (EB) - Represents passive stiffness during diastole.
-            # Affects how easily the ventricle fills (Preload).
-            ("chambers.LV.EB",          0.1,    0.01,  1.0,   0.1),
-            ("chambers.RV.EB",          0.05,   0.01,  1.0,   0.1),
+            # 2. Stiffness: Keep this low/soft to help filling.
+            ("chambers.LV.EB",          0.05,   0.01,  0.2,   0.1),
+            ("chambers.RV.EB",          0.03,   0.01,  0.10,  0.1),
 
-            # Resistance (R) - Opposition to blood flow.
-            ("circulation.SYS.R_AR",    1.05,   0.5,   3.0,   1.0),  # Systemic Resistance
-            ("circulation.PUL.R_AR",    0.08,   0.01,  1.0,   1.0),  # Pulmonary Resistance
+            # 3. Resistance: Widen bounds to allow lower resistance (helper for high SV)
+            ("circulation.SYS.R_AR",    0.95,   0.5,   2.5,   1.0), # <--- Widened
+            ("circulation.PUL.R_AR",    0.06,   0.02,  0.5,   1.0),
 
-            # Compliance (C) - Elasticity of arteries and veins.
-            ("circulation.SYS.C_AR",    1.1,    0.5,   3.0,   1.0),  # Arterial Compliance
-            ("circulation.SYS.C_VEN",   50.0,   10.0,  150.0, 10.0), # Venous Compliance (Reservoir)
+            # 4. Compliance: Allow veins to be stiffer (lower C) to boost preload.
+            ("circulation.SYS.C_AR",    1.2,    0.8,   3.0,   1.0),
+            ("circulation.SYS.C_VEN",   40.0,   5.0,   100.0, 10.0), # <--- Allow lower compliance
 
-            # VOLUME OFFSET CONTROL (Synthetic Parameter)
-            # We allow the optimizer to add/remove up to 500mL of blood
-            ("TOTAL_VOLUME_OFFSET",     0.0,   -500.0, 500.0, 100.0)
+            # 5. VOLUME OFFSET: FORCE IT HIGH.
+            ("TOTAL_VOLUME_OFFSET",     300.0,  -500.0, 1500.0, 100.0)
         ]
 
     def get_initial_guess(self):
@@ -176,6 +177,7 @@ def cost_function(scaled_x):
     p_rv = history["p_RV"][slc]
     v_rv = history["V_RV"][slc]
     p_ao = history["p_AR_SYS"][slc]
+    p_la = history["p_LA"][slc] # <--- Extract LA Pressure
 
     if np.max(p_rv) > 300.0 or np.isnan(np.sum(p_rv)):
         #safety check for unphysiological from PH optimization
@@ -187,7 +189,10 @@ def cost_function(scaled_x):
         "SV":     np.max(v_lv) - np.min(v_lv),
         "RV_ESP": np.max(p_rv),
         "RV_EDP": np.min(p_rv),
-        "Ao_DBP": np.min(p_ao)
+        "Ao_DBP": np.min(p_ao),
+        "LA_P_MEAN": np.mean(p_la),
+        "RV_EDV":    np.max(v_rv),
+        "LV_EDV":    np.max(v_lv)
     }
 
     # Calculate Weighted Error
@@ -202,7 +207,7 @@ def cost_function(scaled_x):
 
     # LV Pressures
     cost += 10.0 * ((metrics["LV_ESP"] - targets["LV_ESP"]) / targets["LV_ESP"])**2
-    cost += 10.0 * ((metrics["LV_EDP"] - targets["LV_EDP"]) / targets["LV_EDP"])**2
+    cost += 50.0 * ((metrics["LV_EDP"] - targets["LV_EDP"]) / targets["LV_EDP"])**2
 
     # RV Pressures (Increased weight for precision)
     cost += 5.0 * ((metrics["RV_ESP"] - targets["RV_ESP"]) / targets["RV_ESP"])**2
@@ -215,6 +220,17 @@ def cost_function(scaled_x):
     else:
         cost += 50.0 * ((metrics["Ao_DBP"] - targets["Ao_DBP"]) / targets["Ao_DBP"])**2
 
+    # 1. LA Pressure Constraint (High Weight)
+    # If LA pressure is high, the RV cannot empty properly.
+    cost += 25.0 * ((metrics["LA_P_MEAN"] - targets["LA_P_MEAN"]) / targets["LA_P_MEAN"])**2
+
+    # 2. RV Volume Constraint
+    cost += 5.0 * ((metrics["RV_EDV"] - targets["RV_EDV"]) / targets["RV_EDV"])**2
+
+    # 3. LV Volume Constraint (CRITICAL)
+    # Force the LV to stay small (~150mL) so it must increase contractility to create SV.
+    cost += 20.0 * ((metrics["LV_EDV"] - targets["LV_EDV"]) / targets["LV_EDV"])**2
+
     # Logging
     if iteration_counter[0] % 10 == 0:
         print(f"Iter {iteration_counter[0]:3d} | Cost: {cost:.4f} | SV: {metrics['SV']:.1f} mL")
@@ -226,77 +242,158 @@ def cost_function(scaled_x):
     return cost
 
 # %% [markdown]
-# ### Run Optimization
-# We use the Nelder-Mead algorithm, which is robust for non-smooth problems like this.
+# ### Run Optimization (Hybrid Strategy)
+# We use a two-stage approach to avoid local minima (like under-filled hearts):
+# 1. **Global Search:** `differential_evolution` explores the parameter space.
+# 2. **Local Refinement:** `Nelder-Mead` polishes the best result.
 
 # %%
-print("\nStarting Optimization...")
-x0 = interface.get_initial_guess()
-bounds = interface.get_bounds()
+# ==============================================================================
+#  MAIN EXECUTION BLOCK
+#  (Required for multiprocessing/workers=-1 to work correctly)
+# ==============================================================================
+if __name__ == "__main__":
 
-# Reset counter
-iteration_counter[0] = 0
-maxiter = 20 if os.getenv("CI") else 1000 # Limit iterations for CI environments
-result = minimize(
-    cost_function,
-    x0,
-    method='Nelder-Mead',
-    bounds=Bounds([b[0] for b in bounds], [b[1] for b in bounds]),
-    options={'maxiter': maxiter, 'xatol': 1e-4, 'fatol': 1e-4, 'disp': True}
-)
+    print("\nStarting Optimization...")
 
-print("\n" + "="*60)
-print("Optimization Complete!")
-print("="*60)
+    # Initialize Interface
+    x0 = interface.get_initial_guess()
+    bounds = interface.get_bounds()
+    iteration_counter[0] = 0
 
-# %% [markdown]
-# ### Analyze Results
-# Let's look at the final parameters and run a verification simulation.
+    # --- Stage 1: Global Search (Differential Evolution) ---
+    print("--- Stage 1: Global Search (Differential Evolution) ---")
 
-# %%
-final_params, final_init = interface.update_model(result.x)
+    # We use workers=-1 to use ALL CPU cores.
+    # This works now because we are inside the 'if __name__' block.
+    maxiter_global = 5 if os.getenv("CI") else 15
 
-print("Final Optimized Parameters:")
-for i, (key, _, _, _, scale) in enumerate(interface.config):
-    val = result.x[i] * scale
-    unit = "mL" if "OFFSET" in key else ""
-    print(f"  {key:<25}: {val:.3f} {unit}")
+    result_stage1 = differential_evolution(
+        cost_function,
+        bounds,
+        strategy='best1bin',
+        maxiter=maxiter_global,
+        popsize=10,
+        disp=True,
+        workers=-1  # <--- Safe to use now!
+    )
 
-print(f"\nFinal Cost: {result.fun:.6f}")
+    print(f"\nStage 1 Best Cost: {result_stage1.fun:.4f}")
 
-# Verification Run
-print("\nRunning Verification Simulation...")
-model_opt = Regazzoni2020(parameters=final_params, initial_state=final_init, add_units=False)
-history = model_opt.solve(num_beats=20, dt=1e-3)
+    # --- Stage 2: Local Refinement (Nelder-Mead) ---
+    print("\n--- Stage 2: Local Refinement (Nelder-Mead) ---")
+    maxiter_local = 20 if os.getenv("CI") else 1000
 
-# Plotting
-samples = int((1/final_params["HR"]) / 1e-3)
-slc = slice(-samples, None)
+    result = minimize(
+        cost_function,
+        x0=result_stage1.x, # Use Global result as starting point
+        method='Nelder-Mead',
+        bounds=Bounds([b[0] for b in bounds], [b[1] for b in bounds]),
+        options={'maxiter': maxiter_local, 'xatol': 1e-4, 'fatol': 1e-4, 'disp': True}
+    )
 
-p_lv = history["p_LV"][slc]
-v_lv = history["V_LV"][slc]
-p_rv = history["p_RV"][slc]
-v_rv = history["V_RV"][slc]
+    print("\n" + "="*60)
+    print("Optimization Complete!")
+    print("="*60)
 
-fig, axs = plt.subplots(1, 2, figsize=(12, 5))
+    # --- Analyze Results ---
+    final_params, final_init = interface.update_model(result.x)
 
-# LV Loop
-axs[0].plot(v_lv, p_lv, 'r-', lw=2, label="Optimized")
-axs[0].set_title(f"Left Ventricle (Target: {targets['LV_ESP']}/{targets['LV_EDP']})")
-axs[0].set_xlabel("Volume [mL]")
-axs[0].set_ylabel("Pressure [mmHg]")
-axs[0].axhline(targets['LV_ESP'], color='k', ls=':', alpha=0.5)
-axs[0].axhline(targets['LV_EDP'], color='k', ls=':', alpha=0.5)
-axs[0].grid(True, alpha=0.3)
+    # 1. Run Verification Simulation
+    print("\n" + "="*60)
+    print("Running Verification Simulation (20 beats)...")
+    model_opt = Regazzoni2020(parameters=final_params, initial_state=final_init, add_units=False, verbose=False)
+    history = model_opt.solve(num_beats=20, dt=1e-3)
 
-# RV Loop
-axs[1].plot(v_rv, p_rv, 'b-', lw=2, label="Optimized")
-axs[1].set_title(f"Right Ventricle (Target: {targets['RV_ESP']}/{targets['RV_EDP']})")
-axs[1].set_xlabel("Volume [mL]")
-axs[1].set_ylabel("Pressure [mmHg]")
-axs[1].axhline(targets['RV_ESP'], color='k', ls=':', alpha=0.5)
-axs[1].axhline(targets['RV_EDP'], color='k', ls=':', alpha=0.5)
-axs[1].grid(True, alpha=0.3)
+    # 2. Extract Final Metrics
+    samples = int((1/final_params["HR"]) / 1e-3)
+    slc = slice(-samples, None)
 
-plt.tight_layout()
-plt.show()
+    p_lv = history["p_LV"][slc]
+    v_lv = history["V_LV"][slc]
+    p_rv = history["p_RV"][slc]
+    v_rv = history["V_RV"][slc]
+    p_ao = history["p_AR_SYS"][slc]
+    p_la = history["p_LA"][slc]
+
+    achieved = {
+        "LV_ESP": np.max(p_lv),
+        "LV_EDP": np.min(p_lv),
+        "SV":     np.max(v_lv) - np.min(v_lv),
+        "RV_ESP": np.max(p_rv),
+        "RV_EDP": np.min(p_rv),
+        "Ao_DBP": np.min(p_ao),
+        "LA_P_MEAN": np.mean(p_la),
+        "RV_EDV":    np.max(v_rv),
+        "LV_EDV":    np.max(v_lv)
+    }
+
+    # 3. Print Report
+    print("\n" + "="*60)
+    print(f"{'METRIC':<15} | {'TARGET':<10} | {'ACHIEVED':<10} | {'ERROR':<8} | {'STATUS'}")
+    print("-" * 60)
+
+    all_passed = True
+    for key, target in targets.items():
+        val = achieved[key]
+        error_pct = ((val - target) / target) * 100
+
+        tol = 10.0
+        if key in ["LV_EDP", "RV_EDP"]: tol = 20.0
+
+        status = "[PASS]" if abs(error_pct) <= tol else "[FAIL]"
+        if status == "[FAIL]": all_passed = False
+
+        print(f"{key:<15} | {target:<10.1f} | {val:<10.1f} | {error_pct:>+6.1f}% | {status}")
+
+    print("-" * 60)
+
+    print("\nOptimized Parameters:")
+    for i, (key, _, _, _, scale) in enumerate(interface.config):
+        val = result.x[i] * scale
+        unit = "mL" if "OFFSET" in key else ""
+        print(f"  {key:<25}: {val:.3f} {unit}")
+
+    # 4. Save to JSON
+    # Custom encoder definition
+    class NumpyEncoder(json.JSONEncoder):
+        def default(self, obj):
+            if isinstance(obj, np.integer): return int(obj)
+            if isinstance(obj, np.floating): return float(obj)
+            if isinstance(obj, np.ndarray): return obj.tolist()
+            return super(NumpyEncoder, self).default(obj)
+
+    filename = "optimized_regazzoni_baseline.json"
+    save_data = {
+        "description": "Optimized healthy baseline parameters",
+        "metrics_achieved": achieved,
+        "parameters": final_params,
+        "initial_state": final_init
+    }
+
+    with open(filename, "w") as f:
+        json.dump(save_data, f, cls=NumpyEncoder, indent=4)
+    print(f"\nModel state successfully saved to {filename}")
+
+    # 5. Plotting
+    fig, axs = plt.subplots(1, 2, figsize=(12, 5))
+
+    # LV Loop
+    axs[0].plot(v_lv, p_lv, 'r-', lw=2, label="Optimized")
+    axs[0].set_title(f"Left Ventricle\nSV: {achieved['SV']:.1f} mL")
+    axs[0].set_xlabel("Volume [mL]")
+    axs[0].set_ylabel("Pressure [mmHg]")
+    axs[0].axhline(targets['LV_ESP'], color='k', ls=':', alpha=0.5)
+    axs[0].axhline(targets['LV_EDP'], color='k', ls=':', alpha=0.5)
+    axs[0].axvline(targets['LV_EDV'], color='r', ls='--', alpha=0.8)
+
+    # RV Loop
+    axs[1].plot(v_rv, p_rv, 'b-', lw=2, label="Optimized")
+    axs[1].set_title(f"Right Ventricle\nEDV: {achieved['RV_EDV']:.1f} mL")
+    axs[1].set_xlabel("Volume [mL]")
+    axs[1].set_ylabel("Pressure [mmHg]")
+    axs[1].axhline(targets['RV_ESP'], color='k', ls=':', alpha=0.5)
+    axs[1].axvline(targets['RV_EDV'], color='r', ls='--', alpha=0.8)
+
+    plt.tight_layout()
+    plt.show()
