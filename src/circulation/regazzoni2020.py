@@ -122,9 +122,10 @@ class Regazzoni2020(base.CirculationModel):
                 self.p_LV = p_LV
                 self._E_LV = lambda t: 1.0  # Dummy function, not used
             else:
-                # Use default time varying elastance model
                 self._E_LV = self.time_varying_elastance(**chambers["LV"])
-                self.p_LV = lambda V, t: self._E_LV(t) * (V - chambers["LV"]["V0"])
+                self.p_LV = self._make_pressure_func(
+                    self._E_LV, chambers["LV"]
+                )
 
         self._E_RA = self.time_varying_elastance(**chambers["RA"])
         self.p_RA = lambda V, t: self._E_RA(t) * (V - chambers["RA"]["V0"])
@@ -134,9 +135,45 @@ class Regazzoni2020(base.CirculationModel):
             self._E_RV = lambda t: 1.0  # Dummy function, not used
         else:
             self._E_RV = self.time_varying_elastance(**chambers["RV"])
-            self.p_RV = lambda V, t: self._E_RV(t) * (V - chambers["RV"]["V0"])
+            self.p_RV = self._make_pressure_func(
+                self._E_RV, chambers["RV"]
+            )
+
+        # Store kE values for Jacobian computation
+        self._kE_LV = float(chambers["LV"].get("kE", 0.0))
+        self._kE_RV = float(chambers["RV"].get("kE", 0.0))
+        self._V0_LV = float(chambers["LV"]["V0"])
+        self._V0_RV = float(chambers["RV"]["V0"])
 
         self._initialize()
+
+    @staticmethod
+    def _make_pressure_func(E_func, chamber_params):
+        """Build a pressure function with optional nonlinear diastolic EDPVR.
+
+        If chamber_params contains 'kE' > 0, the passive (diastolic) component
+        uses an exponential pressure-volume relationship::
+
+            P_passive = (EB / kE) * (exp(kE * (V - V0)) - 1)
+
+        which linearises to EB * (V - V0) as kE -> 0.  The active component
+        remains linear: P_active = (E(t) - EB) * (V - V0).
+        """
+        V0 = chamber_params["V0"]
+        EB = chamber_params["EB"]
+        kE = chamber_params.get("kE", 0.0)
+
+        if kE > 0:
+            def p_func(V, t):
+                dV = V - V0
+                p_active = (E_func(t) - EB) * dV
+                p_passive = (EB / kE) * (np.exp(kE * dV) - 1.0)
+                return p_active + p_passive
+        else:
+            def p_func(V, t):
+                return E_func(t) * (V - V0)
+
+        return p_func
 
     @property
     def HR(self) -> float:
@@ -315,9 +352,22 @@ class Regazzoni2020(base.CirculationModel):
         L_AR_PUL = self.parameters["circulation"]["PUL"]["L_AR"]
         L_VEN_PUL = self.parameters["circulation"]["PUL"]["L_VEN"]
         E_LA = self._E_LA(t)
-        E_LV = self._E_LV(t)
         E_RA = self._E_RA(t)
-        E_RV = self._E_RV(t)
+        # dP/dV for LV and RV, accounting for nonlinear EDPVR
+        EB_LV = self.parameters["chambers"]["LV"]["EB"]
+        if self._kE_LV > 0:
+            E_LV = (self._E_LV(t) - EB_LV) + EB_LV * np.exp(
+                self._kE_LV * (y[1] - self._V0_LV)
+            )
+        else:
+            E_LV = self._E_LV(t)
+        EB_RV = self.parameters["chambers"]["RV"]["EB"]
+        if self._kE_RV > 0:
+            E_RV = (self._E_RV(t) - EB_RV) + EB_RV * np.exp(
+                self._kE_RV * (y[3] - self._V0_RV)
+            )
+        else:
+            E_RV = self._E_RV(t)
         var = self._get_var(t)
         R_MV = self.R_MV(var[0], var[1])
         R_AV = self.R_AV(var[1], y[4])

@@ -1,12 +1,33 @@
 #!/usr/bin/env python3
 """
-Mesh-Specific Circulation Optimization — Option D
-===================================================
-Unified optimizer that replaces both optimize_healthy_baseline.py and
-optimize_pah.py.  The core idea: the FEM mesh has fixed cavity volumes,
-so the 0D circulation model must be tuned to match *those* volumes.
-Disease severity is classified by pressure targets only; stroke volume
-and ejection fraction are emergent quantities.
+Mesh-Specific Circulation Optimization — v11
+=============================================
+Unified optimizer that tunes the 0D Regazzoni 2020 circulation model to a
+spectrum of RV systolic pressures, using the FEM mesh's cavity volumes as
+fixed geometric constraints.
+
+v11 target-framework rewrite (2026-04-22)
+------------------------------------------
+The spectrum's ONE independent variable is RV_ESP — this drives the
+transmural septal pressure collapse (P_LV_ES - P_RV_ES → 0 at end-stage PAH),
+which is the central mechanical finding of the thesis. All other hemodynamic
+variables are physiological guardrails: either held constant at healthy-normal
+values (LV_ESP, LV_EDP, Ao_DBP, LA_P_MEAN, LVEF_floor), or assigned via three
+Humbert 2022 ESC/ERS risk-stratum bands (RV_EDP, CI_min, RVEF_floor).
+
+Every target is traceable to a specific primary source (Humbert 2022,
+Kovacs 2009, Benza 2010/2012, Tello 2019) — see:
+  /global/D1/homes/dtsteene/cardiac-work/results/docs/target_grounding_audit.md
+
+Changed from v10:
+  - LV_ESP, LV_EDP, Ao_DBP, LA_P_MEAN now held constant (v10 per-severity
+    declines had no primary source).
+  - LV_EF_floor held at 0.55 for all severities (LVEF not prognostic per
+    Baggen 2016).
+  - RV_EDP, RVEF_floor, CI_min assigned in three ESC bands (Humbert T16).
+  - CO_min (L/min) replaced by CI_min (L/min/m²) to match ESC convention.
+    Cost function now multiplies CI by --bsa (default 1.75 m²).
+  - Optuna study names prefixed "v11_" so they do not collide with v10 DBs.
 
 Run modes
 ---------
@@ -14,12 +35,13 @@ Run modes
   python optimize_mesh_circ.py --mesh /path/to/healthy.xdmf --severity moderate
   python optimize_mesh_circ.py --mesh ukb --severity all
   python optimize_mesh_circ.py --mesh ukb --severity healthy --eval-only
+  python optimize_mesh_circ.py --mesh ukb --severity all --bsa 1.82
 
 Outputs (per severity, in results_mesh_{mesh}/)
 ------------------------------------------------
   optimized_regazzoni_{mesh}_{severity}.json   best parameters
   pv_evaluation_{mesh}_{severity}.png          evaluation figure
-  mesh_{mesh}_{severity}.db                    Optuna study (SQLite)
+  v11_mesh_{mesh}_{severity}.db                Optuna study (SQLite)
 """
 
 import argparse
@@ -34,7 +56,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import optuna
 from matplotlib.gridspec import GridSpec
-from optuna.samplers import TPESampler
+from optuna.samplers import TPESampler, CmaEsSampler
 
 from circulation.regazzoni2020 import Regazzoni2020
 
@@ -51,6 +73,12 @@ UNIT_TO_ML = {
     "cm": 1.0,             # cm³ = mL
     "m":  1e6,             # m³  → mL
 }
+
+# Default body surface area for CI calculation.
+# 1.75 m² is a reasonable adult mean; override via --bsa for patient-specific runs.
+# Used to convert simulated absolute CO (L/min) into CI (L/min/m²) for
+# comparison with Humbert 2022 Table 16 risk-stratum cutoffs.
+DEFAULT_BSA_M2 = 1.75
 
 
 def read_mesh_volumes(mesh_path, mesh_unit=None):
@@ -146,57 +174,88 @@ def read_mesh_volumes(mesh_path, mesh_unit=None):
 
 
 # ==============================================================================
-# SEVERITY — PRESSURE TARGETS ONLY
+# SEVERITY — PRESSURE TARGETS + PHYSIOLOGICAL GUARDRAILS (v11)
 # ==============================================================================
+# Provenance: every target traces to a specific table in a specific paper.
+# See: /global/D1/homes/dtsteene/cardiac-work/results/docs/target_grounding_audit.md
+#
+# The spectrum's ONE independent variable is RV_ESP — this drives the
+# transmural septal pressure collapse (P_LV_ES - P_RV_ES → 0 at end-stage),
+# which is the central mechanical finding of the thesis.
+#
+# Everything else is a physiological guardrail: either held constant at a
+# healthy value (because pre-capillary PAH does not alter that variable) or
+# assigned one of three ESC risk-stratum bands (low / intermediate / high).
+#
+# RV_ESP anchor points:
+#   healthy (22):     Kovacs 2009 Table 1, p.890 — sPAP mean 20.8 ± 4.4 (n=625)
+#   borderline (30):  Kovacs 2009 p.890 text — sPAP ULN (mean + 2SD) = 29.6
+#   severe (75):      Tello 2019 Table 2, p.4 — PASP 75 ± 24 (severe-PH cohort)
+#   (mild 45, moderate 55, moderate_severe 65, very_severe 85, end_stage 95:
+#    interpolated/extrapolated between the three anchors)
+#
+# Held-constant targets (no per-severity variation):
+#   LV_ESP = 120:    Benza 2010 Table 1, p.166 — SBP 116 ± 17 mmHg (n=2716,
+#                    full PAH cohort, mostly WHO-FC II-III). Systemic BP is
+#                    preserved in pre-capillary PAH.
+#   LV_EDP = 8:      Kovacs 2009 Table 1, p.890 — PAWP 8.0 ± 2.9 (n=882).
+#                    LVEDP ≈ PAWP in pre-capillary PAH.
+#   Ao_DBP = 80:     Consistent with Benza 2010 preserved SBP; conventional
+#                    adult normal DBP. No paper supports a decline.
+#   LA_P_MEAN = 8:   Kovacs 2009 Table 1 — PAWP 8.0. Humbert 2022 Table 5
+#                    (p.20) bounds pre-capillary PH at PAWP ≤ 15.
+#
+# Prior v10 ramps LV_ESP (118→90), LV_EDP (8→4), Ao_DBP (80→60),
+# LA_P_MEAN (8→7), and LV_EF_floor (0.55→0.20) had no primary source
+# in the cited literature and have been dropped. See audit document.
+
 SEVERITY_PRESSURE_TARGETS = {
-    "healthy_low": {
-        "RV_ESP":    20.0,   # Lower target so FEM emerges near 25
-        "RV_EDP":    3.0,
-        "LV_ESP":    110.0,
-        "LV_EDP":    8.0,
-        "Ao_DBP":    75.0,
-        "LA_P_MEAN": 8.0,
-    },
-    "healthy": {
-        "RV_ESP":    25.0,
-        "RV_EDP":    4.0,
-        "LV_ESP":    120.0,
-        "LV_EDP":    10.0,
-        "Ao_DBP":    80.0,
-        "LA_P_MEAN": 9.0,
-    },
-    "mild": {
-        "RV_ESP":    38.0,
-        "RV_EDP":    6.0,
-        "LV_ESP":    118.0,
-        "LV_EDP":    9.0,
-        "Ao_DBP":    78.0,
-        "LA_P_MEAN": 9.0,
-    },
-    "moderate": {
-        "RV_ESP":    50.0,
-        "RV_EDP":    8.0,
-        "LV_ESP":    112.0,
-        "LV_EDP":    8.0,
-        "Ao_DBP":    75.0,
-        "LA_P_MEAN": 9.0,
-    },
-    "moderate_severe": {
-        "RV_ESP":    63.0,
-        "RV_EDP":    10.0,
-        "LV_ESP":    105.0,
-        "LV_EDP":    7.0,
-        "Ao_DBP":    80.0,   # Raised from 72 — systemic BP preserved in PAH
-        "LA_P_MEAN": 8.5,
-    },
-    "severe": {
-        "RV_ESP":    72.0,
-        "RV_EDP":    12.0,
-        "LV_ESP":    100.0,
-        "LV_EDP":    6.0,
-        "Ao_DBP":    68.0,
-        "LA_P_MEAN": 8.0,
-    },
+    # RV_ESP is the independent variable of the study; everything else is constant.
+    "healthy_low":     {"RV_ESP": 22.0, "RV_EDP": 5.0,  "LV_ESP": 120.0, "LV_EDP": 8.0, "Ao_DBP": 80.0, "LA_P_MEAN": 8.0},
+    "healthy":         {"RV_ESP": 22.0, "RV_EDP": 5.0,  "LV_ESP": 120.0, "LV_EDP": 8.0, "Ao_DBP": 80.0, "LA_P_MEAN": 8.0},
+    "borderline":      {"RV_ESP": 30.0, "RV_EDP": 5.0,  "LV_ESP": 120.0, "LV_EDP": 8.0, "Ao_DBP": 80.0, "LA_P_MEAN": 8.0},
+    "mild":            {"RV_ESP": 45.0, "RV_EDP": 5.0,  "LV_ESP": 120.0, "LV_EDP": 8.0, "Ao_DBP": 80.0, "LA_P_MEAN": 8.0},
+    "moderate":        {"RV_ESP": 55.0, "RV_EDP": 10.0, "LV_ESP": 120.0, "LV_EDP": 8.0, "Ao_DBP": 80.0, "LA_P_MEAN": 8.0},
+    "moderate_severe": {"RV_ESP": 65.0, "RV_EDP": 10.0, "LV_ESP": 120.0, "LV_EDP": 8.0, "Ao_DBP": 80.0, "LA_P_MEAN": 8.0},
+    "severe":          {"RV_ESP": 75.0, "RV_EDP": 16.0, "LV_ESP": 120.0, "LV_EDP": 8.0, "Ao_DBP": 80.0, "LA_P_MEAN": 8.0},
+    "very_severe":     {"RV_ESP": 85.0, "RV_EDP": 16.0, "LV_ESP": 120.0, "LV_EDP": 8.0, "Ao_DBP": 80.0, "LA_P_MEAN": 8.0},
+    "end_stage":       {"RV_ESP": 95.0, "RV_EDP": 16.0, "LV_ESP": 120.0, "LV_EDP": 8.0, "Ao_DBP": 80.0, "LA_P_MEAN": 8.0},
+}
+
+# Physiological guardrails — three ESC risk bands from Humbert 2022 Table 16, p.45.
+# (Three-strata model; 1-year mortality low <5% / intermediate 5-20% / high >20%.)
+#
+#   Low-risk band:          RAP <8,   CI ≥2.5,  RVEF >54%
+#   Intermediate band:      RAP 8-14, CI 2.0-2.4, RVEF 37-54%
+#   High-risk band:         RAP >14,  CI <2.0,  RVEF <37%
+#
+# Severity-to-band assignment:
+#   Low:          healthy_low, healthy, borderline, mild
+#   Intermediate: moderate, moderate_severe
+#   High:         severe, very_severe, end_stage
+#
+# LVEF floor held at 0.55 throughout: LVEF is not prognostic in PAH
+# (Baggen 2016 Eur Radiol 26:3771–3780, pooled HR 1.06 p=0.301). No primary
+# source publishes per-severity LVEF floors for pre-capillary PAH, so the
+# prior v10 ramp (0.55→0.20) was invented.
+#
+# NOTE: CI is cardiac INDEX (L/min/m²), NOT absolute CO (L/min). The cost
+# function computes CI = CO_lpm / BSA using the module-level DEFAULT_BSA_M2
+# (overridable via --bsa CLI arg).
+
+SEVERITY_PHYSIOLOGY = {
+    # Low-risk band (Humbert T16 low-risk column)
+    "healthy_low":     {"LV_EF_floor": 0.55, "RV_EF_floor": 0.54, "CI_min": 2.5},
+    "healthy":         {"LV_EF_floor": 0.55, "RV_EF_floor": 0.54, "CI_min": 2.5},
+    "borderline":      {"LV_EF_floor": 0.55, "RV_EF_floor": 0.54, "CI_min": 2.5},
+    "mild":            {"LV_EF_floor": 0.55, "RV_EF_floor": 0.54, "CI_min": 2.5},
+    # Intermediate band (Humbert T16 intermediate-risk column)
+    "moderate":        {"LV_EF_floor": 0.55, "RV_EF_floor": 0.37, "CI_min": 2.0},
+    "moderate_severe": {"LV_EF_floor": 0.55, "RV_EF_floor": 0.37, "CI_min": 2.0},
+    # High-risk band (Humbert T16 high-risk column)
+    "severe":          {"LV_EF_floor": 0.55, "RV_EF_floor": 0.25, "CI_min": 1.5},
+    "very_severe":     {"LV_EF_floor": 0.55, "RV_EF_floor": 0.25, "CI_min": 1.5},
+    "end_stage":       {"LV_EF_floor": 0.55, "RV_EF_floor": 0.25, "CI_min": 1.5},
 }
 
 
@@ -214,7 +273,7 @@ PARAMETER_CONFIG = [
     ("chambers.RV.TR",          0.40,   0.28,   0.45,   1.0,   "RV relaxation duration [s]"),
 
     # -- Left heart ------------------------------------------------------------
-    ("chambers.LV.EA",          2.8,    0.5,    10.0,   1.0,   "LV max elastance"),
+    ("chambers.LV.EA",          2.8,    0.5,    15.0,   1.0,   "LV max elastance"),
     ("chambers.LV.EB",          0.09,   0.02,   0.30,   0.1,   "LV passive elastance"),
     ("chambers.LV.V0",          42.0,   20.0,   80.0,   1.0,   "LV unstressed volume [mL]"),
     ("chambers.LV.TC",          0.25,   0.18,   0.30,   1.0,   "LV contraction duration [s]"),
@@ -226,15 +285,19 @@ PARAMETER_CONFIG = [
     ("valves.MV.Rmin",          0.01,   0.001,  0.08,   0.01,  "Mitral valve min resistance"),
 
     # -- Systemic circulation --------------------------------------------------
-    ("circulation.SYS.R_AR",   0.95,   0.4,    2.0,    1.0,   "Systemic arterial resistance"),
+    ("circulation.SYS.R_AR",   0.90,   0.4,    1.4,    1.0,   "Systemic arterial resistance"),  # capped at clinical max ~1.4
     ("circulation.SYS.C_AR",   1.2,    0.4,    3.5,    1.0,   "Systemic arterial compliance"),
-    ("circulation.SYS.C_VEN",  25.0,   10.0,   30.0,   10.0,  "Systemic venous compliance"),
+    ("circulation.SYS.C_VEN",  40.0,   10.0,   100.0,  10.0,  "Systemic venous compliance"),  # wider range for preload control
 
     # -- Pulmonary circulation -------------------------------------------------
     ("circulation.PUL.R_AR",   0.20,   0.05,   0.8,    0.1,   "Pulmonary arterial resistance"),
     ("circulation.PUL.C_AR",   0.50,   0.10,   1.0,    0.1,   "Pulmonary arterial compliance"),
     ("circulation.PUL.R_VEN",  0.15,   0.01,   1.0,    0.01,  "Pulmonary venous resistance"),
     ("circulation.PUL.C_VEN",  25.0,   5.0,    50.0,   10.0,  "Pulmonary venous compliance"),
+
+    # -- Diastolic nonlinearity (exponential EDPVR) ----------------------------
+    ("chambers.LV.kE",         0.01,   0.0,    0.04,   0.01,  "LV diastolic stiffening [1/mL]"),
+    ("chambers.RV.kE",         0.01,   0.0,    0.04,   0.01,  "RV diastolic stiffening [1/mL]"),
 
     # -- Blood volume ----------------------------------------------------------
     ("TOTAL_VOLUME_OFFSET",    300.0,  0.0,    2000.0, 100.0, "Total volume offset [mL]"),
@@ -285,26 +348,71 @@ def _tolerances(pressure_targets, mesh_lv_edv, mesh_rv_edv):
     return tol
 
 
-def compute_cost(metrics, pressure_targets, mesh_lv_edv, mesh_rv_edv, rv_sv):
-    """Option D cost: pressure targets + mesh volume matching + SV balance."""
+def _dynamic_weight(base_weight, rel_error, relax_threshold=0.05):
+    """Reduce weight when close to target so optimizer focuses on remaining gaps."""
+    if rel_error < relax_threshold:
+        return base_weight * (rel_error / relax_threshold)
+    return base_weight
+
+
+def compute_cost(metrics, pressure_targets, mesh_lv_edv, mesh_rv_edv, rv_sv,
+                  physiology=None, hr=1.25, bsa=DEFAULT_BSA_M2):
+    """Cost: pressure targets + mesh volumes + SV balance + physiological guardrails.
+
+    Pressure targets traced to primary literature; physiology floors are ESC
+    risk-stratum bands (Humbert 2022 Table 16). See target_grounding_audit.md.
+    """
     c = 0.0
 
-    # --- PRESSURE targets (this IS the severity classification) ---
-    c += 200.0 * _rel(metrics["RV_ESP"], pressure_targets["RV_ESP"])
-    c += 100.0 * _rel(metrics["RV_EDP"], pressure_targets["RV_EDP"])
-    c += 200.0 * _rel(metrics["LV_ESP"], pressure_targets["LV_ESP"])
-    c += 100.0 * _rel(metrics["LV_EDP"], pressure_targets["LV_EDP"])
-    c += 100.0 * _rel(metrics["Ao_DBP"], pressure_targets["Ao_DBP"])
-    c += 150.0 * _rel(metrics["LA_P_MEAN"], pressure_targets["LA_P_MEAN"])
+    # --- PRESSURE targets ---
+    # RV_ESP is the independent variable of the spectrum; LV_ESP, LV_EDP,
+    # Ao_DBP, LA_P_MEAN are held at healthy-normal values across the spectrum.
+    for key, base_w in [("RV_ESP", 200.0), ("LV_ESP", 200.0),
+                        ("RV_EDP", 150.0), ("LV_EDP", 150.0),
+                        ("Ao_DBP", 100.0), ("LA_P_MEAN", 150.0)]:
+        rel = _rel(metrics[key], pressure_targets[key])
+        c += _dynamic_weight(base_w, rel) * rel
 
     # --- VOLUME targets (match the mesh — makes ratio ~ 1) ---
-    c += 250.0 * _rel(metrics["LV_EDV"], mesh_lv_edv)
-    c += 250.0 * _rel(metrics["RV_EDV"], mesh_rv_edv)
+    for edv, mesh in [("LV_EDV", mesh_lv_edv), ("RV_EDV", mesh_rv_edv)]:
+        rel = _rel(metrics[edv], mesh)
+        c += _dynamic_weight(400.0, rel) * rel
 
     # --- SV BALANCE (mass conservation — LV and RV must eject equally) ---
     c += 300.0 * abs(metrics["SV"] - rv_sv) / max(1.0, metrics["SV"])
 
-    # --- DO NOT target SV magnitude — it is emergent ---
+    # --- PHYSIOLOGICAL GUARDRAILS (soft floor penalties from ESC bands) ---
+    if physiology is not None:
+        lv_edv = metrics["LV_EDV"]
+        rv_edv = metrics["RV_EDV"]
+        lv_sv = metrics["SV"]
+
+        # LV EF floor — held at 0.55 for all severities (Baggen 2016: LVEF
+        # not prognostic in PAH, so no per-severity ramp is justifiable).
+        if lv_edv > 0:
+            lv_ef = lv_sv / lv_edv
+            ef_floor = physiology["LV_EF_floor"]
+            if lv_ef < ef_floor:
+                deficit = (ef_floor - lv_ef) / ef_floor
+                c += 400.0 * deficit  # steep penalty below floor
+
+        # RV EF floor — ESC band cutoffs from Humbert 2022 Table 16, p.45.
+        if rv_edv > 0:
+            rv_ef = rv_sv / rv_edv
+            ef_floor_rv = physiology["RV_EF_floor"]
+            if rv_ef < ef_floor_rv:
+                deficit = (ef_floor_rv - rv_ef) / ef_floor_rv
+                c += 300.0 * deficit
+
+        # Cardiac INDEX barrier — Humbert 2022 Table 16 uses CI (L/min/m²)
+        # not absolute CO. CI = CO_lpm / BSA.
+        # Low-risk CI ≥2.5, intermediate 2.0-2.4, high <2.0 L/min/m².
+        co_lpm = lv_sv * hr * 60.0 / 1000.0  # mL/beat * beats/s * 60 s/min / 1000
+        ci = co_lpm / bsa
+        ci_min = physiology["CI_min"]
+        if ci < ci_min:
+            deficit = (ci_min - ci) / ci_min
+            c += 500.0 * deficit  # strong penalty — sub-physiological CI is unacceptable
 
     return c
 
@@ -313,7 +421,16 @@ def compute_cost(metrics, pressure_targets, mesh_lv_edv, mesh_rv_edv, rv_sv):
 # MODEL INTERFACE
 # ==============================================================================
 class ModelInterface:
-    def __init__(self):
+    def __init__(self, linear=False):
+        """
+        Parameters
+        ----------
+        linear : bool
+            If True, force kE=0 for both ventricles (linear Regazzoni EDPVR).
+            If False (default), kE is a free parameter in PARAMETER_CONFIG
+            and the optimizer chooses it (exponential Klotz-style EDPVR).
+        """
+        self.linear = linear
         base = Regazzoni2020(add_units=False)
         self.base_params = base.parameters
         self.base_init = base._initial_state
@@ -323,6 +440,9 @@ class ModelInterface:
         init_state = self.base_init.copy()
 
         for key, _, _, _, scale, _ in PARAMETER_CONFIG:
+            # Skip kE entries when --linear is set; they are set to 0 below.
+            if self.linear and key in ("chambers.LV.kE", "chambers.RV.kE"):
+                continue
             real_val = suggested[key] * scale
 
             if key == "TOTAL_VOLUME_OFFSET":
@@ -338,22 +458,32 @@ class ModelInterface:
                     d = d[k]
                 d[parts[-1]] = real_val
 
+        # Force linear EDPVR by pinning kE to exactly zero if requested.
+        if self.linear:
+            params["chambers"]["LV"]["kE"] = 0.0
+            params["chambers"]["RV"]["kE"] = 0.0
+
         return params, init_state
 
 
 # ==============================================================================
 # OBJECTIVE FACTORY
 # ==============================================================================
-def make_objective(interface, pressure_targets, mesh_lv_edv, mesh_rv_edv):
+def make_objective(interface, pressure_targets, mesh_lv_edv, mesh_rv_edv,
+                   physiology=None, bsa=DEFAULT_BSA_M2):
     # Clamp V0 upper bounds: unstressed volume must be below EDV
     v0_caps = {
         "chambers.RV.V0": mesh_rv_edv - 5.0,
         "chambers.LV.V0": mesh_lv_edv - 5.0,
     }
+    # In --linear mode, kE is fixed at 0 and excluded from the Optuna search.
+    kE_keys = ("chambers.LV.kE", "chambers.RV.kE")
 
     def objective(trial):
         suggested = {}
         for key, _, lb, ub, scale, _ in PARAMETER_CONFIG:
+            if interface.linear and key in kE_keys:
+                continue  # not searched; interface.build pins these to 0
             lo, hi = lb / scale, ub / scale
             if key in v0_caps:
                 hi = min(hi, v0_caps[key] / scale)
@@ -363,25 +493,30 @@ def make_objective(interface, pressure_targets, mesh_lv_edv, mesh_rv_edv):
         params, init_state = interface.build(suggested)
 
         # Guard: activation timing must fit within one heartbeat
+        # Return graded penalty instead of pruning (gives optimizer gradient info)
         lv = params["chambers"]["LV"]
-        if lv["TC"] + lv["TR"] + lv.get("tC", 0.1) > 0.78:
-            raise optuna.exceptions.TrialPruned()
+        timing = lv["TC"] + lv["TR"] + lv.get("tC", 0.1)
+        if timing > 0.78:
+            return 5000.0 + 1000.0 * (timing - 0.78)
 
         model = Regazzoni2020(
             parameters=params, initial_state=init_state,
             add_units=False, verbose=False,
         )
         try:
-            history = model.solve(num_beats=15, dt=2e-3)
+            history = model.solve(num_beats=20, dt=1e-3)
         except Exception:
-            raise optuna.exceptions.TrialPruned()
+            return 8000.0
 
-        samples = int((1 / params["HR"]) / 2e-3)
+        hr = params["HR"]
+        samples = int((1 / hr) / 1e-3)
 
-        if np.max(history["p_RV"][-samples:]) > 300.0:
-            raise optuna.exceptions.TrialPruned()
-        if np.isnan(np.sum(history["p_RV"][-samples:])):
-            raise optuna.exceptions.TrialPruned()
+        # Graded penalties instead of hard pruning
+        prv_max = np.max(history["p_RV"][-samples:])
+        if np.isnan(prv_max):
+            return 9000.0
+        if prv_max > 300.0:
+            return 5000.0 + prv_max
 
         # Extract metrics from last two beats
         slc_last = slice(-samples, None)
@@ -397,6 +532,7 @@ def make_objective(interface, pressure_targets, mesh_lv_edv, mesh_rv_edv):
 
         cost = compute_cost(
             metrics, pressure_targets, mesh_lv_edv, mesh_rv_edv, rv_sv,
+            physiology=physiology, hr=hr, bsa=bsa,
         )
 
         # Convergence penalty: compare SV between last two beats
@@ -415,37 +551,49 @@ def make_objective(interface, pressure_targets, mesh_lv_edv, mesh_rv_edv):
 # OPTIMISATION
 # ==============================================================================
 def run_optimization(severity, mesh_lv_edv, mesh_rv_edv, mesh_name,
-                     n_trials, outdir, seed=42):
+                     n_trials, outdir, seed=42, bsa=DEFAULT_BSA_M2,
+                     linear=False):
     pressure_targets = SEVERITY_PRESSURE_TARGETS[severity]
-    study_name = f"mesh_{mesh_name}_{severity}"
+    physiology = SEVERITY_PHYSIOLOGY.get(severity)
+    edpvr_tag = "linear" if linear else "exp"
+    study_name = f"v11_mesh_{mesh_name}_{severity}_{edpvr_tag}"
     out_json = str(outdir / f"optimized_regazzoni_{mesh_name}_{severity}.json")
 
+    edpvr_desc = "linear (kE pinned at 0)" if linear else "exponential Klotz (kE free)"
     print("\n" + "=" * 65)
     print(f"  Optimising: {severity} ({mesh_name} mesh, {n_trials} trials)")
-    print(f"  Mesh volumes: LV_EDV={mesh_lv_edv} mL, RV_EDV={mesh_rv_edv} mL")
+    print(f"  Mesh volumes: LV_EDV={mesh_lv_edv:.1f} mL, RV_EDV={mesh_rv_edv:.1f} mL")
+    print(f"  BSA: {bsa:.2f} m²")
+    print(f"  EDPVR: {edpvr_desc}")
     print("=" * 65)
     print("\nPressure targets:")
     for k, v in pressure_targets.items():
         print(f"  {k:<14}: {v}")
     print(f"\nVolume targets (from mesh):")
-    print(f"  LV_EDV       : {mesh_lv_edv}")
-    print(f"  RV_EDV       : {mesh_rv_edv}")
+    print(f"  LV_EDV       : {mesh_lv_edv:.1f}")
+    print(f"  RV_EDV       : {mesh_rv_edv:.1f}")
     print(f"  SV           : (emergent)")
+    if physiology:
+        print(f"\nPhysiological guardrails (ESC Humbert 2022 T16 bands):")
+        print(f"  LV EF floor  : {physiology['LV_EF_floor']*100:.0f}%")
+        print(f"  RV EF floor  : {physiology['RV_EF_floor']*100:.0f}%")
+        print(f"  CI minimum   : {physiology['CI_min']:.1f} L/min/m²")
 
-    interface = ModelInterface()
+    interface = ModelInterface(linear=linear)
 
     study = optuna.create_study(
         study_name=study_name,
         storage=f"sqlite:///{outdir / f'{study_name}.db'}",
         load_if_exists=True,
         direction="minimize",
-        sampler=TPESampler(n_startup_trials=100, seed=seed),
+        sampler=CmaEsSampler(seed=seed, warn_independent_sampling=False),
     )
 
     study.optimize(
-        make_objective(interface, pressure_targets, mesh_lv_edv, mesh_rv_edv),
+        make_objective(interface, pressure_targets, mesh_lv_edv, mesh_rv_edv,
+                       physiology=physiology, bsa=bsa),
         n_trials=n_trials,
-        n_jobs=-1,
+        n_jobs=1,
         show_progress_bar=True,
     )
 
@@ -477,12 +625,29 @@ def run_optimization(severity, mesh_lv_edv, mesh_rv_edv, mesh_name,
                 return obj.tolist()
             return super().default(obj)
 
+    # Compute derived hemodynamic metrics
+    hr = params["HR"]
+    lv_ef = metrics["SV"] / metrics["LV_EDV"] * 100 if metrics["LV_EDV"] > 0 else 0
+    rv_edv_val = metrics["RV_EDV"]
+    rv_sv_val = np.max(history["V_RV"][slc]) - np.min(history["V_RV"][slc])
+    rv_ef = rv_sv_val / rv_edv_val * 100 if rv_edv_val > 0 else 0
+    co_lpm = metrics["SV"] * hr * 60.0 / 1000.0
+    ci_lpm_m2 = co_lpm / bsa
+
     save_data = {
-        "description": f"Mesh-specific circulation: {mesh_name} {severity}",
+        "description": f"Mesh-specific circulation: {mesh_name} {severity} "
+                       f"({'linear' if linear else 'exponential'} EDPVR)",
         "mesh_volumes_mL": {"LV_EDV": mesh_lv_edv, "RV_EDV": mesh_rv_edv},
         "severity": severity,
+        "bsa_m2": bsa,
+        "edpvr_model": "linear" if linear else "exponential_klotz",
         "pressure_targets": pressure_targets,
+        "physiology_guardrails": physiology,
         "metrics_achieved": metrics,
+        "derived_hemodynamics": {
+            "LV_EF_pct": lv_ef, "RV_EF_pct": rv_ef,
+            "CO_Lpm": co_lpm, "CI_Lpm_m2": ci_lpm_m2, "RV_SV": rv_sv_val,
+        },
         "parameters": params,
         "initial_state": init_state,
     }
@@ -496,7 +661,8 @@ def run_optimization(severity, mesh_lv_edv, mesh_rv_edv, mesh_name,
 # ==============================================================================
 # EVALUATION
 # ==============================================================================
-def evaluate_and_plot(severity, mesh_lv_edv, mesh_rv_edv, mesh_name, json_path, outdir):
+def evaluate_and_plot(severity, mesh_lv_edv, mesh_rv_edv, mesh_name, json_path, outdir,
+                       bsa=DEFAULT_BSA_M2):
     pressure_targets = SEVERITY_PRESSURE_TARGETS[severity]
     tols = _tolerances(pressure_targets, mesh_lv_edv, mesh_rv_edv)
 
@@ -512,9 +678,9 @@ def evaluate_and_plot(severity, mesh_lv_edv, mesh_rv_edv, mesh_name, json_path, 
         parameters=parameters, initial_state=initial_state,
         add_units=False, verbose=False,
     )
-    history = model.solve(num_beats=50, dt=2e-3)
+    history = model.solve(num_beats=50, dt=1e-3)
 
-    samples = int((1 / parameters["HR"]) / 2e-3)
+    samples = int((1 / parameters["HR"]) / 1e-3)
     slc = slice(-samples, None)
 
     v_lv = history["V_LV"][slc]; p_lv = history["p_LV"][slc]
@@ -560,6 +726,27 @@ def evaluate_and_plot(severity, mesh_lv_edv, mesh_rv_edv, mesh_name, json_path, 
     print(f"{'SV_BALANCE':<14} | {'0.0':>8} | {sv_diff:>9.2f} | "
           f"{'':>8} | {'<2mL':>5} | {'PASS' if sv_ok else 'FAIL'}")
     if not sv_ok:
+        all_pass = False
+
+    # EF and CI diagnostics
+    lv_ef = (lv_sv / m["LV_EDV"] * 100) if m["LV_EDV"] > 0 else 0
+    rv_ef = (rv_sv / m["RV_EDV"] * 100) if m["RV_EDV"] > 0 else 0
+    co_lpm = lv_sv * parameters["HR"] * 60.0 / 1000.0
+    ci = co_lpm / bsa
+    physiology = SEVERITY_PHYSIOLOGY.get(severity, {})
+    lv_ef_floor = physiology.get("LV_EF_floor", 0.30) * 100
+    rv_ef_floor = physiology.get("RV_EF_floor", 0.20) * 100
+    ci_min = physiology.get("CI_min", 1.5)
+    lv_ef_ok = lv_ef >= lv_ef_floor
+    rv_ef_ok = rv_ef >= rv_ef_floor
+    ci_ok = ci >= ci_min
+    print(f"{'LV_EF':<14} | {lv_ef_floor:>7.0f}% | {lv_ef:>8.1f}% | "
+          f"{'':>8} | {'floor':>5} | {'PASS' if lv_ef_ok else 'FAIL'}")
+    print(f"{'RV_EF':<14} | {rv_ef_floor:>7.0f}% | {rv_ef:>8.1f}% | "
+          f"{'':>8} | {'floor':>5} | {'PASS' if rv_ef_ok else 'FAIL'}")
+    print(f"{'CI (L/min/m²)':<14} | {ci_min:>8.1f} | {ci:>9.2f} | "
+          f"{'':>8} | {'floor':>5} | {'PASS' if ci_ok else 'FAIL'}")
+    if not lv_ef_ok or not rv_ef_ok or not ci_ok:
         all_pass = False
 
     # Volume ratio diagnostic
@@ -656,6 +843,17 @@ def evaluate_and_plot(severity, mesh_lv_edv, mesh_rv_edv, mesh_name, json_path, 
     rows.append(["SV (emergent)", "--", f"{m['SV']:.1f}", "--", "INFO"])
     cell_colors.append(["#f5f5f5"] * 4 + ["#daeef3"])
 
+    # Add EF and CO rows
+    rows.append(["LV EF", f">{lv_ef_floor:.0f}%", f"{lv_ef:.1f}%", "--",
+                 "PASS" if lv_ef_ok else "FAIL"])
+    cell_colors.append(["#f5f5f5"] * 4 + ["#c6efce" if lv_ef_ok else "#ffc7ce"])
+    rows.append(["RV EF", f">{rv_ef_floor:.0f}%", f"{rv_ef:.1f}%", "--",
+                 "PASS" if rv_ef_ok else "FAIL"])
+    cell_colors.append(["#f5f5f5"] * 4 + ["#c6efce" if rv_ef_ok else "#ffc7ce"])
+    rows.append(["CI (L/min/m²)", f">{ci_min:.1f}", f"{ci:.2f}", "--",
+                 "PASS" if ci_ok else "FAIL"])
+    cell_colors.append(["#f5f5f5"] * 4 + ["#c6efce" if ci_ok else "#ffc7ce"])
+
     # Add SV balance row
     sv_flag = "PASS" if sv_ok else "FAIL"
     rows.append(["SV balance", "0.0", f"{sv_diff:.2f}", "--", sv_flag])
@@ -743,6 +941,18 @@ def main():
         "--seed", type=int, default=42,
         help="Random seed for TPE sampler (default: 42).",
     )
+    parser.add_argument(
+        "--bsa", type=float, default=DEFAULT_BSA_M2,
+        help=f"Body surface area in m² for CI calculation "
+             f"(default: {DEFAULT_BSA_M2}, UKB mean mesh).",
+    )
+    parser.add_argument(
+        "--linear", action="store_true",
+        help="Force linear Regazzoni EDPVR by pinning kE=0 for both ventricles. "
+             "Default is exponential Klotz-style EDPVR (kE free parameter). "
+             "When --linear is set, the mesh-name gets a '_linear' suffix in "
+             "output filenames so A/B test results don't collide.",
+    )
     args = parser.parse_args()
 
     # Read cavity volumes: from mesh, or from CLI overrides
@@ -754,12 +964,18 @@ def main():
     else:
         parser.error("Provide --mesh, or both --lv-edv and --rv-edv.")
     mesh_name = args.mesh_name or auto_name
+    # When --linear is active, tag the mesh-name so output directories, JSON
+    # files, and Optuna databases do not collide with the exponential run.
+    if args.linear and not mesh_name.endswith("_linear"):
+        mesh_name = f"{mesh_name}_linear"
 
     # Create output directory next to this script
     outdir = Path(__file__).resolve().parent / f"results_mesh_{mesh_name}"
     outdir.mkdir(exist_ok=True)
 
     print(f"\nMesh volumes: LV_EDV = {lv_edv:.1f} mL, RV_EDV = {rv_edv:.1f} mL")
+    print(f"BSA: {args.bsa:.2f} m²")
+    print(f"EDPVR model: {'LINEAR (kE=0 fixed)' if args.linear else 'EXPONENTIAL (kE free)'}")
     print(f"Output directory: {outdir}")
 
     severities = all_severities if args.severity == "all" else [args.severity]
@@ -771,10 +987,12 @@ def main():
         if not args.eval_only:
             out_json = run_optimization(
                 sev, lv_edv, rv_edv, mesh_name,
-                args.n_trials, outdir, args.seed,
+                args.n_trials, outdir, args.seed, bsa=args.bsa,
+                linear=args.linear,
             )
 
-        evaluate_and_plot(sev, lv_edv, rv_edv, mesh_name, out_json, outdir)
+        evaluate_and_plot(sev, lv_edv, rv_edv, mesh_name, out_json, outdir,
+                          bsa=args.bsa)
 
 
 if __name__ == "__main__":
